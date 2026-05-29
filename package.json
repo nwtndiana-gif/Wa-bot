@@ -7,7 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0",
+    "@whiskeysockets/baileys": "^6.7.16",
     "axios": "^1.6.0",
     "dotenv": "^16.0.0",
     "groq-sdk": "^0.3.0",
