@@ -682,6 +682,15 @@ const startBot = async () => {
 process.on('uncaughtException', err => process.stdout.write('UNCAUGHT: ' + err.stack + '\n'));
 process.on('unhandledRejection', err => process.stdout.write('REJECTION: ' + (err?.stack || err) + '\n'));
 
+// ── HTTP KEEPALIVE (prevents Railway SIGTERM) ─────────────────
+const http = require('http');
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('Bot is running');
+}).listen(process.env.PORT || 3000, () => {
+  process.stdout.write('HTTP server listening on port ' + (process.env.PORT || 3000) + '\n');
+});
+
 // ── START ─────────────────────────────────────────────────────
 (async () => {
   redisClient = await initRedis();
