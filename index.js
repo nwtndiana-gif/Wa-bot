@@ -42,11 +42,9 @@ const warnings       = {};
 const spamTracker    = {};
 const approvedUsers  = new Set();
 const celebDone      = new Set();
-let   isReconnecting = false; // prevent duplicate reconnect loops
+let   isReconnecting = false;
 
 // ── SESSION DIRECTORY ────────────────────────────────────────
-// Must exist before useMultiFileAuthState is called.
-// Railway containers start fresh so we always ensure it exists.
 try {
   fs.mkdirSync(CONFIG.sessionDir, { recursive: true });
   process.stdout.write('Session directory ready: ' + CONFIG.sessionDir + '\n');
@@ -54,27 +52,50 @@ try {
   process.stdout.write('Could not create session dir: ' + e.message + '\n');
 }
 
+// ── JID NORMALISATION ────────────────────────────────────────
+// WhatsApp now uses @lid (Linked ID) format in addition to @s.whatsapp.net.
+// Strip the device suffix and keep only number@domain so comparisons work
+// across both formats.
+const normaliseJid = (jid) => {
+  if (!jid) return '';
+  return jid.replace(/:.*@/, '@');   // "1234:5@s.whatsapp.net" → "1234@s.whatsapp.net"
+};
+
 // ── HELPERS ──────────────────────────────────────────────────
 
+/**
+ * Check whether `uid` is an admin of group `gid`.
+ * Works for both @s.whatsapp.net and @lid JIDs.
+ */
 const isAdmin = async (sock, gid, uid) => {
   try {
     const g = await sock.groupMetadata(gid);
-    return g.participants
-      .filter(p => p.admin)
-      .map(p => p.id)
-      .includes(uid);
+    if (!g || !g.participants) return false;
+    const uidNorm = normaliseJid(uid);
+    return g.participants.some(p => p.admin && normaliseJid(p.id) === uidNorm);
   } catch { return false; }
 };
 
+/**
+ * Check whether the bot itself is an admin of group `gid`.
+ * Compares against both the phone JID and the LID (if present) so the
+ * lookup succeeds regardless of which format WhatsApp reports for the bot.
+ */
 const isBotAdmin = async (sock, gid) => {
   try {
-    const g      = await sock.groupMetadata(gid);
-    const botJid = sock.user.id.replace(/:.*@/, '@');
-    const botLid = sock.user.lid ? sock.user.lid.replace(/:.*@/, '@') : null;
-    const admins = g.participants
-      .filter(p => p.admin)
-      .map(p => p.id.replace(/:.*@/, '@'));
-    return admins.includes(botJid) || (botLid && admins.includes(botLid));
+    const g = await sock.groupMetadata(gid);
+    if (!g || !g.participants) return false;
+
+    // Normalise the bot's known identities
+    const botPhoneNorm = sock.user?.id  ? normaliseJid(sock.user.id)  : null;
+    const botLidNorm   = sock.user?.lid ? normaliseJid(sock.user.lid) : null;
+
+    return g.participants.some(p => {
+      if (!p.admin) return false;
+      const pNorm = normaliseJid(p.id);
+      return (botPhoneNorm && pNorm === botPhoneNorm) ||
+             (botLidNorm   && pNorm === botLidNorm);
+    });
   } catch { return false; }
 };
 
@@ -164,7 +185,6 @@ const setupCelebrations = (sock, gid) => {
 // ── COMMANDS ─────────────────────────────────────────────────
 
 const handleCmd = async (sock, msg, text, gid, sender) => {
-  // Only act in groups where bot is admin
   const botAdmin = await isBotAdmin(sock, gid);
   if (!botAdmin) return;
 
@@ -488,12 +508,10 @@ const clearSession = () => {
 
 // ── MAIN BOT ─────────────────────────────────────────────────
 const startBot = async () => {
-  // Guard against duplicate reconnect calls
   if (isReconnecting) return;
   isReconnecting = true;
 
   try {
-    // Ensure session folder exists before auth init
     fs.mkdirSync(CONFIG.sessionDir, { recursive: true });
 
     const { state, saveCreds } = await useMultiFileAuthState(CONFIG.sessionDir);
@@ -505,26 +523,21 @@ const startBot = async () => {
       version,
       auth: {
         creds: state.creds,
-        // CacheableSignalKeyStore reduces auth errors on Railway
         keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
       },
       printQRInTerminal: false,
       logger:            pino({ level: 'silent' }),
-      // Mimic a real WhatsApp Web browser session
       browser:           ['Ubuntu', 'Chrome', '20.0.04'],
       syncFullHistory:   false,
       markOnlineOnConnect: false
     });
 
-    // Persist credentials whenever they change
     sock.ev.on('creds.update', saveCreds);
 
     // ── PAIRING CODE ──────────────────────────────────────────
-    // Only requested when the session has no registered credentials.
-    // Wrapped in try/catch so a missing or undefined code never crashes.
     if (!state.creds.registered) {
       const rawNumber = (process.env.PAIRING_NUMBER || '254718160377')
-        .replace(/[^0-9]/g, ''); // digits only
+        .replace(/[^0-9]/g, '');
 
       process.stdout.write('Not registered. Requesting pairing code for: ' + rawNumber + '\n');
 
@@ -532,10 +545,7 @@ const startBot = async () => {
         try {
           const code = await sock.requestPairingCode(rawNumber);
           if (!code) throw new Error('Received empty pairing code');
-
-          // Format XXXXXXXX → XXXX-XXXX for readability
           const formatted = String(code).match(/.{1,4}/g).join('-');
-
           process.stdout.write('\n==============================\n');
           process.stdout.write('PAIRING CODE: ' + formatted + '\n');
           process.stdout.write('==============================\n');
@@ -544,22 +554,24 @@ const startBot = async () => {
           process.stdout.write('Pairing code error: ' + e.message + '\n');
           process.stdout.write('Will retry on next restart.\n');
         }
-      }, 3000); // 3-second delay lets the socket stabilise first
+      }, 3000);
     }
 
     // ── CONNECTION UPDATES ────────────────────────────────────
     sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-      isReconnecting = false; // reset guard on any update
+      isReconnecting = false;
 
       if (connection === 'open') {
         process.stdout.write('✅ Bot connected to WhatsApp!\n');
+        // Log bot JIDs for debugging
+        process.stdout.write('Bot phone JID: ' + (sock.user?.id  || 'unknown') + '\n');
+        process.stdout.write('Bot LID:       ' + (sock.user?.lid || 'none')    + '\n');
       }
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         process.stdout.write('Connection closed. Code: ' + statusCode + '\n');
 
-        // 401 or loggedOut → wipe session and re-pair
         if (
           statusCode === DisconnectReason.loggedOut ||
           statusCode === 401
@@ -568,7 +580,6 @@ const startBot = async () => {
           clearSession();
           setTimeout(startBot, 5000);
         } else {
-          // Any other disconnect → just reconnect
           process.stdout.write('Reconnecting in 5 seconds...\n');
           setTimeout(startBot, 5000);
         }
@@ -582,7 +593,6 @@ const startBot = async () => {
       const botAdmin = await isBotAdmin(sock, id);
       if (!botAdmin) return;
 
-      // Credit whoever added the members towards their invite gate count
       if (author) {
         if (!inviteCount[author]) inviteCount[author] = 0;
         inviteCount[author] += participants.length;
@@ -597,7 +607,6 @@ const startBot = async () => {
         }
       }
 
-      // Welcome each new member and explain the invite gate
       for (const p of participants) {
         inviteCount[p] = inviteCount[p] || 0;
         await sendMsg(sock, id,
@@ -612,7 +621,6 @@ const startBot = async () => {
 
     // ── MESSAGES ─────────────────────────────────────────────
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      // 'notify' = new incoming messages; ignore history sync
       if (type !== 'notify') return;
 
       for (const msg of messages) {
@@ -620,7 +628,7 @@ const startBot = async () => {
           if (!msg.message || msg.key.fromMe) continue;
 
           const gid = msg.key.remoteJid;
-          if (!gid || !gid.endsWith('@g.us')) continue; // groups only
+          if (!gid || !gid.endsWith('@g.us')) continue;
 
           const sender = msg.key.participant;
           if (!sender) continue;
@@ -632,13 +640,11 @@ const startBot = async () => {
           const admin    = await isAdmin(sock, gid, sender);
           const botAdmin = await isBotAdmin(sock, gid);
 
-          // Log every group message for debugging on Railway
           process.stdout.write(
             '[MSG] gid=' + gid + ' sender=' + sender +
             ' botAdmin=' + botAdmin + ' text=' + (text || '[no text]') + '\n'
           );
 
-          // Bot must be admin to moderate or respond
           if (!botAdmin) continue;
 
           // ── Porn filter ──
@@ -698,11 +704,9 @@ const startBot = async () => {
             await handleCmd(sock, msg, text, gid, sender);
           }
 
-          // Register celebrations for this group (runs once per gid)
           setupCelebrations(sock, gid);
 
         } catch (e) {
-          // Log full error, not just message
           process.stdout.write('Message handler error: ' + e.stack + '\n');
         }
       }
