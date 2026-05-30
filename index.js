@@ -68,12 +68,13 @@ const isAdmin = async (sock, gid, uid) => {
 
 const isBotAdmin = async (sock, gid) => {
   try {
-    const g     = await sock.groupMetadata(gid);
-    const botId = sock.user.id.replace(/:.*@/, '@');
-    return g.participants
+    const g      = await sock.groupMetadata(gid);
+    const botJid = sock.user.id.replace(/:.*@/, '@');
+    const botLid = sock.user.lid ? sock.user.lid.replace(/:.*@/, '@') : null;
+    const admins = g.participants
       .filter(p => p.admin)
-      .map(p => p.id.replace(/:.*@/, '@'))
-      .includes(botId);
+      .map(p => p.id.replace(/:.*@/, '@'));
+    return admins.includes(botJid) || (botLid && admins.includes(botLid));
   } catch { return false; }
 };
 
