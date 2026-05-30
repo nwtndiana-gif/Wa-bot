@@ -306,7 +306,7 @@ const startBot=async()=>{
 
   sock.ev.on('creds.update',saveCreds);
 
-  const phoneNumber=process.env.PAIRING_NUMBER||'254718160377';
+  const phoneNumber=process.env.PAIRING_NUMBER||'254718160377';.replace(/\D/g, '');
   if(!state.creds.registered){
     setTimeout(async()=>{
       try{
