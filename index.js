@@ -1,4 +1,5 @@
 require('dotenv').config();
+
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -6,22 +7,28 @@ const {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const axios = require('axios');
-const cron = require('node-cron');
+
+const pino   = require('pino');
+const axios  = require('axios');
+const cron   = require('node-cron');
 const { exec } = require('child_process');
-const fs = require('fs');
-const Groq = require('groq-sdk');
+const fs     = require('fs');
+const Groq   = require('groq-sdk');
 
-const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
+// ── GROQ ─────────────────────────────────────────────────────
+const groq = process.env.GROQ_API_KEY
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
+  : null;
 
+// ── CONFIG ───────────────────────────────────────────────────
 const CONFIG = {
-  prefix: '!',
-  inviteGate: 2,
-  maxLinks: 2,
-  spamLimit: 5,
-  spamWindow: 10000,
-  timezone: 'Africa/Nairobi'
+  prefix:      '!',
+  inviteGate:  2,
+  maxLinks:    2,
+  spamLimit:   5,
+  spamWindow:  10000,
+  timezone:    'Africa/Nairobi',
+  sessionDir:  './session'
 };
 
 const PORN_DOMAINS = [
@@ -29,24 +36,39 @@ const PORN_DOMAINS = [
   'redtube.com','youporn.com','spankbang.com','beeg.com'
 ];
 
-const inviteCount = {};
-const warnings = {};
-const spamTracker = {};
-const approvedUsers = new Set();
-const celebrationsDone = new Set();
+// ── STATE ────────────────────────────────────────────────────
+const inviteCount    = {};
+const warnings       = {};
+const spamTracker    = {};
+const approvedUsers  = new Set();
+const celebDone      = new Set();
+let   isReconnecting = false; // prevent duplicate reconnect loops
+
+// ── SESSION DIRECTORY ────────────────────────────────────────
+// Must exist before useMultiFileAuthState is called.
+// Railway containers start fresh so we always ensure it exists.
+try {
+  fs.mkdirSync(CONFIG.sessionDir, { recursive: true });
+  process.stdout.write('Session directory ready: ' + CONFIG.sessionDir + '\n');
+} catch (e) {
+  process.stdout.write('Could not create session dir: ' + e.message + '\n');
+}
 
 // ── HELPERS ──────────────────────────────────────────────────
 
 const isAdmin = async (sock, gid, uid) => {
   try {
     const g = await sock.groupMetadata(gid);
-    return g.participants.filter(p => p.admin).map(p => p.id).includes(uid);
+    return g.participants
+      .filter(p => p.admin)
+      .map(p => p.id)
+      .includes(uid);
   } catch { return false; }
 };
 
 const isBotAdmin = async (sock, gid) => {
   try {
-    const g = await sock.groupMetadata(gid);
+    const g     = await sock.groupMetadata(gid);
     const botId = sock.user.id.replace(/:.*@/, '@');
     return g.participants
       .filter(p => p.admin)
@@ -58,27 +80,32 @@ const isBotAdmin = async (sock, gid) => {
 const sendMsg = async (sock, jid, text, mentions) => {
   try {
     await sock.sendMessage(jid, { text, ...(mentions && { mentions }) });
-  } catch (e) { console.log('sendMsg error:', e.message); }
+  } catch (e) {
+    process.stdout.write('sendMsg error: ' + e.message + '\n');
+  }
 };
 
 const deleteMsg = async (sock, jid, msg) => {
   try {
     await sock.sendMessage(jid, {
       delete: {
-        remoteJid: jid,
-        fromMe: false,
-        id: msg.key.id,
+        remoteJid:   jid,
+        fromMe:      false,
+        id:          msg.key.id,
         participant: msg.key.participant
       }
     });
-  } catch (e) {}
+  } catch (_) {}
 };
 
-const getLinks = (text) => text.match(/(https?:\/\/[^\s]+)|(www\.[^\s]+)/gi) || [];
+const getLinks = (text) =>
+  text.match(/(https?:\/\/[^\s]+)|(www\.[^\s]+)/gi) || [];
 
 const hasPornLink = (text) => {
   const links = getLinks(text);
-  return links.some(link => PORN_DOMAINS.some(d => link.toLowerCase().includes(d)));
+  return links.some(link =>
+    PORN_DOMAINS.some(d => link.toLowerCase().includes(d))
+  );
 };
 
 const isSpam = (uid) => {
@@ -94,17 +121,19 @@ const askAI = async (q) => {
   try {
     const r = await groq.chat.completions.create({
       messages: [{ role: 'user', content: q }],
-      model: 'llama3-8b-8192'
+      model:    'llama3-8b-8192'
     });
     return r.choices[0]?.message?.content || 'No response';
-  } catch (e) { return 'AI error: ' + e.message; }
+  } catch (e) {
+    return 'AI error: ' + e.message;
+  }
 };
 
 // ── CELEBRATIONS ─────────────────────────────────────────────
 
 const setupCelebrations = (sock, gid) => {
-  if (celebrationsDone.has(gid)) return;
-  celebrationsDone.add(gid);
+  if (celebDone.has(gid)) return;
+  celebDone.add(gid);
 
   cron.schedule('0 0 1 1 *', async () => {
     await sendMsg(sock, gid, '🎆 *HAPPY NEW YEAR!* 🎆\n\nWishing everyone an amazing New Year! 🥂✨');
@@ -119,12 +148,14 @@ const setupCelebrations = (sock, gid) => {
     const m = now.getMonth() + 1;
     const d = now.getDate();
     if (m === 10 && d === 20) await sendMsg(sock, gid, '🇰🇪 *HAPPY MASHUJAA DAY!* 🇰🇪\n\nHonoring our heroes! 🦁⚔️');
-    if (m === 6 && d === 1)   await sendMsg(sock, gid, '🇰🇪 *HAPPY MADARAKA DAY!* 🇰🇪\n\nTujivunie kuwa Wakenya! 🕊️');
+    if (m === 6  && d === 1)  await sendMsg(sock, gid, '🇰🇪 *HAPPY MADARAKA DAY!* 🇰🇪\n\nTujivunie kuwa Wakenya! 🕊️');
     if (m === 12 && d === 12) await sendMsg(sock, gid, '🇰🇪 *HAPPY JAMHURI DAY!* 🇰🇪\n\nProud to be Kenyan! 🎉');
-    if (m === 5 && d === 1)   await sendMsg(sock, gid, '🇰🇪 *HAPPY LABOUR DAY!* 🇰🇪\n\nHonoring all hardworking Kenyans! 💪');
+    if (m === 5  && d === 1)  await sendMsg(sock, gid, '🇰🇪 *HAPPY LABOUR DAY!* 🇰🇪\n\nHonoring all hardworking Kenyans! 💪');
     if (m === 10 && d === 10) await sendMsg(sock, gid, '🇰🇪 *HAPPY UTAMADUNI DAY!* 🇰🇪\n\nUmoja ni nguvu! 🎭');
-    if ((m === 4 && d === 10) || (m === 3 && d === 30)) await sendMsg(sock, gid, '☪️ *EID MUBARAK!* ☪️\n\nBlessed Eid to all Muslims! 🌙🤲');
-    if ((m === 6 && d === 16) || (m === 6 && d === 17)) await sendMsg(sock, gid, '☪️ *EID UL ADHA MUBARAK!* ☪️\n\nMay Allah accept your sacrifices! 🌙🤲');
+    if ((m === 4 && d === 10) || (m === 3 && d === 30))
+      await sendMsg(sock, gid, '☪️ *EID MUBARAK!* ☪️\n\nBlessed Eid to all Muslims! 🌙🤲');
+    if ((m === 6 && d === 16) || (m === 6 && d === 17))
+      await sendMsg(sock, gid, '☪️ *EID UL ADHA MUBARAK!* ☪️\n\nMay Allah accept your sacrifices! 🌙🤲');
     if (m === 11 && d === 1)  await sendMsg(sock, gid, '🪔 *HAPPY DIWALI!* 🪔\n\nFestival of lights! ✨');
   }, { timezone: CONFIG.timezone });
 };
@@ -132,62 +163,56 @@ const setupCelebrations = (sock, gid) => {
 // ── COMMANDS ─────────────────────────────────────────────────
 
 const handleCmd = async (sock, msg, text, gid, sender) => {
+  // Only act in groups where bot is admin
   const botAdmin = await isBotAdmin(sock, gid);
   if (!botAdmin) return;
 
-  const args = text.slice(CONFIG.prefix.length).trim().split(' ');
-  const cmd = args.shift().toLowerCase();
-  const rest = args.join(' ');
-  const admin = await isAdmin(sock, gid, sender);
+  const args      = text.slice(CONFIG.prefix.length).trim().split(' ');
+  const cmd       = args.shift().toLowerCase();
+  const rest      = args.join(' ');
+  const admin     = await isAdmin(sock, gid, sender);
   const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
 
   switch (cmd) {
+
     case 'menu':
       await sendMsg(sock, gid,
 `╔══════════════════════╗
 ║     🤖 BOT MENU      ║
 ╚══════════════════════╝
 
-👮 *ADMIN COMMANDS*
-!kick @user - Remove from group
-!ban @user - Ban member
-!warn @user - Warn (3 = kick)
-!mute - Lock group
-!unmute - Unlock group
-!tagall [msg] - Tag everyone
-!rules - Show group rules
-!poll Q? Op1, Op2 - Create poll
-!approve @user - Approve user
-!unapprove @user - Unapprove user
+👮 *ADMIN*
+!kick !ban !warn @user
+!mute / !unmute
+!tagall [msg]
+!approve / !unapprove @user
+!rules  !poll Q? A,B
 
-🤖 *AI COMMANDS*
-!ai [question] - Ask AI
-!roast @user - Roast someone 🔥
-!ship @u1 @u2 - Compatibility
+🤖 *AI*
+!ai [question]
+!roast @user
+!ship @u1 @u2
 
 😂 *FUN*
-!joke !quote !fact !8ball [q]
+!joke  !quote  !fact  !8ball [q]
 
 🛠️ *UTILITY*
 !weather [city]
-!crypto - BTC/ETH/SOL prices
+!crypto
 !translate [lang] [text]
-!calculate [math]
+!calculate [expr]
 !remind [mins] [msg]
-!news - Headlines
-!time - Kenya time
+!news
+!time
 
 🎵 *MEDIA*
-!song [name] - Download MP3
-!video [name] - Download MP4
-!tiktok [url] - Download TikTok
-!lyrics [song] - Song summary
+!song / !video [name]
+!tiktok [url]
+!lyrics [song]
 
-🛡️ *AUTO-MOD (always on)*
-• Anti-spam
-• Anti-link (max ${CONFIG.maxLinks} links)
-• Porn filter 🔞
-• Invite gate (add ${CONFIG.inviteGate} members to chat)`);
+🛡️ *AUTO-MOD*
+Anti-spam | Anti-link (max ${CONFIG.maxLinks})
+Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
       break;
 
     case 'ai':
@@ -198,7 +223,7 @@ const handleCmd = async (sock, msg, text, gid, sender) => {
 
     case 'joke':
       try {
-        const j = await axios.get('https://v2.jokeapi.dev/joke/Any?safe-mode');
+        const j  = await axios.get('https://v2.jokeapi.dev/joke/Any?safe-mode');
         const jd = j.data;
         await sendMsg(sock, gid, jd.type === 'single' ? jd.joke : jd.setup + '\n\n😂 ' + jd.delivery);
       } catch { await sendMsg(sock, gid, '😂 Why did the bot crash? Too many requests!'); }
@@ -218,17 +243,18 @@ const handleCmd = async (sock, msg, text, gid, sender) => {
       } catch { await sendMsg(sock, gid, '🧠 Honey bees can recognize human faces!'); }
       break;
 
-    case '8ball':
-      const answers = ['Yes!','No!','Maybe...','Definitely!','Not a chance!','Ask again later','Without a doubt!','Very doubtful'];
-      await sendMsg(sock, gid, '🎱 ' + answers[Math.floor(Math.random() * answers.length)]);
+    case '8ball': {
+      const pool = ['Yes!','No!','Maybe...','Definitely!','Not a chance!','Ask again later','Without a doubt!','Very doubtful'];
+      await sendMsg(sock, gid, '🎱 ' + pool[Math.floor(Math.random() * pool.length)]);
       break;
+    }
 
     case 'calculate':
       if (!rest) return sendMsg(sock, gid, '❌ Usage: !calculate 2+2');
       try {
         const result = eval(rest.replace(/[^0-9+\-*/.()%]/g, ''));
         await sendMsg(sock, gid, '🧮 ' + rest + ' = *' + result + '*');
-      } catch { await sendMsg(sock, gid, '❌ Invalid calculation'); }
+      } catch { await sendMsg(sock, gid, '❌ Invalid expression'); }
       break;
 
     case 'time':
@@ -247,11 +273,15 @@ const handleCmd = async (sock, msg, text, gid, sender) => {
       try {
         const c = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd');
         const d = c.data;
-        await sendMsg(sock, gid, '💰 *Crypto Prices*\n\n₿ BTC: $' + d.bitcoin.usd.toLocaleString() + '\nΞ ETH: $' + d.ethereum.usd.toLocaleString() + '\n◎ SOL: $' + d.solana.usd.toLocaleString());
+        await sendMsg(sock, gid,
+          '💰 *Crypto Prices*\n\n' +
+          '₿ BTC: $' + d.bitcoin.usd.toLocaleString() + '\n' +
+          'Ξ ETH: $' + d.ethereum.usd.toLocaleString() + '\n' +
+          '◎ SOL: $' + d.solana.usd.toLocaleString());
       } catch { await sendMsg(sock, gid, '❌ Could not fetch prices'); }
       break;
 
-    case 'translate':
+    case 'translate': {
       if (!rest) return sendMsg(sock, gid, '❌ Usage: !translate french Hello');
       const tp = rest.split(' ');
       const tl = tp.shift();
@@ -259,23 +289,28 @@ const handleCmd = async (sock, msg, text, gid, sender) => {
       await sendMsg(sock, gid, '🌍 Translating...');
       await sendMsg(sock, gid, '🌍 *' + tl + ':* ' + await askAI('Translate to ' + tl + ': "' + tt + '". Reply with translation only.'));
       break;
+    }
 
     case 'roast':
       if (!mentioned.length) return sendMsg(sock, gid, '❌ Tag someone to roast!');
-      const roastTarget = mentioned[0].split('@')[0];
       await sock.sendMessage(gid, {
-        text: '🔥 @' + roastTarget + ' ' + await askAI('Give a funny harmless roast for ' + roastTarget + '. Keep it light.'),
+        text: '🔥 @' + mentioned[0].split('@')[0] + ' ' +
+          await askAI('Give a funny harmless roast for ' + mentioned[0].split('@')[0] + '. Keep it light.'),
         mentions: mentioned
       });
       break;
 
     case 'ship':
       if (mentioned.length < 2) return sendMsg(sock, gid, '❌ Tag 2 people!');
-      const sp = Math.floor(Math.random() * 100) + 1;
-      await sock.sendMessage(gid, {
-        text: '💕 @' + mentioned[0].split('@')[0] + ' + @' + mentioned[1].split('@')[0] + '\n\n❤️ ' + sp + '% compatible!\n\n' + (sp > 70 ? '🔥 Perfect match!' : sp > 40 ? '💛 Good potential!' : '💔 Not great...'),
-        mentions: mentioned
-      });
+      {
+        const pct = Math.floor(Math.random() * 100) + 1;
+        await sock.sendMessage(gid, {
+          text: '💕 @' + mentioned[0].split('@')[0] + ' + @' + mentioned[1].split('@')[0] +
+            '\n\n❤️ ' + pct + '% compatible!\n\n' +
+            (pct > 70 ? '🔥 Perfect match!' : pct > 40 ? '💛 Good potential!' : '💔 Not great...'),
+          mentions: mentioned
+        });
+      }
       break;
 
     case 'kick':
@@ -304,7 +339,7 @@ const handleCmd = async (sock, msg, text, gid, sender) => {
       await sendMsg(sock, gid, '🔊 Group unmuted! Everyone can send messages.');
       break;
 
-    case 'warn':
+    case 'warn': {
       if (!admin) return sendMsg(sock, gid, '❌ Admins only!');
       if (!mentioned.length) return sendMsg(sock, gid, '❌ Tag someone!');
       const wu = mentioned[0];
@@ -318,19 +353,26 @@ const handleCmd = async (sock, msg, text, gid, sender) => {
         await sock.sendMessage(gid, { text: '⚠️ Warning ' + warnings[wu] + '/3 for @' + wu.split('@')[0], mentions: [wu] });
       }
       break;
+    }
 
     case 'approve':
       if (!admin) return sendMsg(sock, gid, '❌ Admins only!');
       if (!mentioned.length) return sendMsg(sock, gid, '❌ Tag someone!');
       for (const u of mentioned) { approvedUsers.add(u); inviteCount[u] = CONFIG.inviteGate; }
-      await sock.sendMessage(gid, { text: '✅ Approved ' + mentioned.map(u => '@' + u.split('@')[0]).join(', ') + ' to chat!', mentions: mentioned });
+      await sock.sendMessage(gid, {
+        text: '✅ Approved ' + mentioned.map(u => '@' + u.split('@')[0]).join(', ') + ' to chat!',
+        mentions: mentioned
+      });
       break;
 
     case 'unapprove':
       if (!admin) return sendMsg(sock, gid, '❌ Admins only!');
       if (!mentioned.length) return sendMsg(sock, gid, '❌ Tag someone!');
       for (const u of mentioned) { approvedUsers.delete(u); inviteCount[u] = 0; }
-      await sock.sendMessage(gid, { text: '❌ Unapproved ' + mentioned.map(u => '@' + u.split('@')[0]).join(', '), mentions: mentioned });
+      await sock.sendMessage(gid, {
+        text: '❌ Unapproved ' + mentioned.map(u => '@' + u.split('@')[0]).join(', '),
+        mentions: mentioned
+      });
       break;
 
     case 'tagall':
@@ -360,18 +402,20 @@ const handleCmd = async (sock, msg, text, gid, sender) => {
 ⚠️ Violations = warnings then kick!`);
       break;
 
-    case 'poll':
+    case 'poll': {
       if (!rest) return sendMsg(sock, gid, '❌ Usage: !poll Question? Option1, Option2');
       const pp = rest.split('?');
       const po = pp[1] ? pp[1].split(',').map(o => o.trim()) : ['Yes', 'No'];
       await sock.sendMessage(gid, { poll: { name: pp[0] + '?', values: po, selectableCount: 1 } });
       break;
+    }
 
     case 'news':
-      await sendMsg(sock, gid, '📰 *Latest News*\n\n' + await askAI('Give me 5 latest world news headlines today in brief. Number them.'));
+      await sendMsg(sock, gid, '📰 *Latest News*\n\n' +
+        await askAI('Give me 5 latest world news headlines today in brief. Number them.'));
       break;
 
-    case 'remind':
+    case 'remind': {
       if (!rest) return sendMsg(sock, gid, '❌ Usage: !remind 5 take medicine');
       const rp = rest.split(' ');
       const rm = parseInt(rp.shift());
@@ -380,6 +424,7 @@ const handleCmd = async (sock, msg, text, gid, sender) => {
       await sendMsg(sock, gid, '⏰ Reminder set for ' + rm + ' minutes!');
       setTimeout(async () => { await sendMsg(sock, gid, '⏰ *REMINDER:* ' + rt); }, rm * 60000);
       break;
+    }
 
     case 'song':
       if (!rest) return sendMsg(sock, gid, '❌ Usage: !song song name');
@@ -423,159 +468,208 @@ const handleCmd = async (sock, msg, text, gid, sender) => {
 
     case 'lyrics':
       if (!rest) return sendMsg(sock, gid, '❌ Usage: !lyrics song name');
-      await sendMsg(sock, gid, '🎵 *' + rest + '*\n\n' + await askAI('Describe the theme and meaning of the song "' + rest + '". Do not reproduce actual lyrics.'));
+      await sendMsg(sock, gid, '🎵 *' + rest + '*\n\n' +
+        await askAI('Describe the theme and meaning of the song "' + rest + '". Do not reproduce actual lyrics.'));
       break;
   }
 };
 
-// ── MAIN BOT ─────────────────────────────────────────────────
-
-const startBot = async () => {
+// ── SAFE SESSION DELETE ───────────────────────────────────────
+const clearSession = () => {
   try {
-    const { state, saveCreds } = await useMultiFileAuthState('session');
-    const { version } = await fetchLatestBaileysVersion();
+    fs.rmSync(CONFIG.sessionDir, { recursive: true, force: true });
+    fs.mkdirSync(CONFIG.sessionDir, { recursive: true });
+    process.stdout.write('Session cleared.\n');
+  } catch (e) {
+    process.stdout.write('clearSession error: ' + e.message + '\n');
+  }
+};
 
-    console.log('Using Baileys version:', version.join('.'));
+// ── MAIN BOT ─────────────────────────────────────────────────
+const startBot = async () => {
+  // Guard against duplicate reconnect calls
+  if (isReconnecting) return;
+  isReconnecting = true;
+
+  try {
+    // Ensure session folder exists before auth init
+    fs.mkdirSync(CONFIG.sessionDir, { recursive: true });
+
+    const { state, saveCreds } = await useMultiFileAuthState(CONFIG.sessionDir);
+    const { version }          = await fetchLatestBaileysVersion();
+
+    process.stdout.write('Baileys version: ' + version.join('.') + '\n');
 
     const sock = makeWASocket({
       version,
       auth: {
         creds: state.creds,
+        // CacheableSignalKeyStore reduces auth errors on Railway
         keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
       },
       printQRInTerminal: false,
-      logger: pino({ level: 'silent' }),
-      browser: ['Ubuntu', 'Chrome', '20.0.04'],
-      syncFullHistory: false,
+      logger:            pino({ level: 'silent' }),
+      // Mimic a real WhatsApp Web browser session
+      browser:           ['Ubuntu', 'Chrome', '20.0.04'],
+      syncFullHistory:   false,
       markOnlineOnConnect: false
     });
 
+    // Persist credentials whenever they change
     sock.ev.on('creds.update', saveCreds);
 
-    // ── PAIRING CODE ──
-    // Only request pairing if not yet registered
-    // Phone number must be digits only, no + or spaces
+    // ── PAIRING CODE ──────────────────────────────────────────
+    // Only requested when the session has no registered credentials.
+    // Wrapped in try/catch so a missing or undefined code never crashes.
     if (!state.creds.registered) {
-      const rawNumber = (process.env.PAIRING_NUMBER || '254718160377').replace(/[^0-9]/g, '');
-      console.log('Requesting pairing code for:', rawNumber);
+      const rawNumber = (process.env.PAIRING_NUMBER || '254718160377')
+        .replace(/[^0-9]/g, ''); // digits only
+
+      process.stdout.write('Not registered. Requesting pairing code for: ' + rawNumber + '\n');
+
       setTimeout(async () => {
         try {
           const code = await sock.requestPairingCode(rawNumber);
-          // Format as XXXX-XXXX for easy reading
-          const formatted = code.match(/.{1,4}/g).join('-');
-          console.log('\n==============================');
-          console.log('   PAIRING CODE:', formatted);
-          console.log('==============================\n');
-          console.log('Go to WhatsApp Business > Linked Devices > Link a Device > Link with phone number');
-          console.log('Enter code:', formatted);
+          if (!code) throw new Error('Received empty pairing code');
+
+          // Format XXXXXXXX → XXXX-XXXX for readability
+          const formatted = String(code).match(/.{1,4}/g).join('-');
+
+          process.stdout.write('\n==============================\n');
+          process.stdout.write('PAIRING CODE: ' + formatted + '\n');
+          process.stdout.write('==============================\n');
+          process.stdout.write('WhatsApp Business > Linked Devices > Link a Device > Link with phone number\n\n');
         } catch (e) {
-          console.log('Pairing code error:', e.message);
-          console.log('Will retry on next restart...');
+          process.stdout.write('Pairing code error: ' + e.message + '\n');
+          process.stdout.write('Will retry on next restart.\n');
         }
-      }, 3000);
+      }, 3000); // 3-second delay lets the socket stabilise first
     }
 
-    // ── CONNECTION UPDATES ──
+    // ── CONNECTION UPDATES ────────────────────────────────────
     sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-      if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const reason = DisconnectReason[statusCode] || statusCode;
-        console.log('Connection closed. Reason:', reason, '| Code:', statusCode);
-
-        if (statusCode === DisconnectReason.loggedOut) {
-          console.log('Logged out. Deleting session and restarting...');
-          // Delete session so fresh pairing happens
-          try {
-            fs.rmSync('session', { recursive: true, force: true });
-          } catch (e) {}
-          setTimeout(startBot, 5000);
-        } else if (statusCode === 401) {
-          console.log('Unauthorized. Deleting session and restarting...');
-          try {
-            fs.rmSync('session', { recursive: true, force: true });
-          } catch (e) {}
-          setTimeout(startBot, 5000);
-        } else {
-          console.log('Reconnecting in 5 seconds...');
-          setTimeout(startBot, 5000);
-        }
-      }
+      isReconnecting = false; // reset guard on any update
 
       if (connection === 'open') {
-        console.log('✅ Bot connected to WhatsApp successfully!');
+        process.stdout.write('✅ Bot connected to WhatsApp!\n');
+      }
+
+      if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        process.stdout.write('Connection closed. Code: ' + statusCode + '\n');
+
+        // 401 or loggedOut → wipe session and re-pair
+        if (
+          statusCode === DisconnectReason.loggedOut ||
+          statusCode === 401
+        ) {
+          process.stdout.write('Session invalid. Clearing and restarting...\n');
+          clearSession();
+          setTimeout(startBot, 5000);
+        } else {
+          // Any other disconnect → just reconnect
+          process.stdout.write('Reconnecting in 5 seconds...\n');
+          setTimeout(startBot, 5000);
+        }
       }
     });
 
-    // ── NEW MEMBERS ──
+    // ── NEW MEMBERS ───────────────────────────────────────────
     sock.ev.on('group-participants.update', async ({ id, participants, action, author }) => {
-      if (action === 'add') {
-        const botAdmin = await isBotAdmin(sock, id);
-        if (!botAdmin) return;
+      if (action !== 'add') return;
 
-        // Credit the person who added members
-        if (author) {
-          if (!inviteCount[author]) inviteCount[author] = 0;
-          inviteCount[author] += participants.length;
-          if (inviteCount[author] >= CONFIG.inviteGate && !approvedUsers.has(author)) {
-            approvedUsers.add(author);
-            await sendMsg(sock, id,
-              '✅ @' + author.split('@')[0] + ' has added ' + inviteCount[author] + ' members and is now approved to chat! 🎉',
-              [author]
-            );
-          }
-        }
+      const botAdmin = await isBotAdmin(sock, id);
+      if (!botAdmin) return;
 
-        // Welcome each new member
-        for (const p of participants) {
-          inviteCount[p] = inviteCount[p] || 0;
+      // Credit whoever added the members towards their invite gate count
+      if (author) {
+        if (!inviteCount[author]) inviteCount[author] = 0;
+        inviteCount[author] += participants.length;
+
+        if (inviteCount[author] >= CONFIG.inviteGate && !approvedUsers.has(author)) {
+          approvedUsers.add(author);
           await sendMsg(sock, id,
-            '👋 Welcome @' + p.split('@')[0] + '!\n\n' +
-            'To unlock chatting you must *add ' + CONFIG.inviteGate + ' members* directly to this group!\n\n' +
-            'Type !menu after approval ✅',
-            [p]
+            '✅ @' + author.split('@')[0] + ' has added ' + inviteCount[author] +
+            ' members and is now approved to chat! 🎉',
+            [author]
           );
         }
       }
+
+      // Welcome each new member and explain the invite gate
+      for (const p of participants) {
+        inviteCount[p] = inviteCount[p] || 0;
+        await sendMsg(sock, id,
+          '👋 Welcome @' + p.split('@')[0] + '!\n\n' +
+          'To unlock chatting you must *add ' + CONFIG.inviteGate +
+          ' members* directly to this group first!\n\n' +
+          'Type !menu after approval ✅',
+          [p]
+        );
+      }
     });
 
-    // ── MESSAGES ──
-    sock.ev.on('messages.upsert', async ({ messages }) => {
+    // ── MESSAGES ─────────────────────────────────────────────
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      // 'notify' = new incoming messages; ignore history sync
+      if (type !== 'notify') return;
+
       for (const msg of messages) {
         try {
           if (!msg.message || msg.key.fromMe) continue;
+
           const gid = msg.key.remoteJid;
-          if (!gid || !gid.endsWith('@g.us')) continue;
+          if (!gid || !gid.endsWith('@g.us')) continue; // groups only
 
           const sender = msg.key.participant;
           if (!sender) continue;
 
-          const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
-          const admin = await isAdmin(sock, gid, sender);
+          const text =
+            msg.message?.conversation ||
+            msg.message?.extendedTextMessage?.text || '';
+
+          const admin    = await isAdmin(sock, gid, sender);
           const botAdmin = await isBotAdmin(sock, gid);
+
+          // Log every group message for debugging on Railway
+          process.stdout.write(
+            '[MSG] gid=' + gid + ' sender=' + sender +
+            ' botAdmin=' + botAdmin + ' text=' + (text || '[no text]') + '\n'
+          );
+
+          // Bot must be admin to moderate or respond
           if (!botAdmin) continue;
 
-          // Porn filter
+          // ── Porn filter ──
           if (text && hasPornLink(text)) {
             await deleteMsg(sock, gid, msg);
             if (!warnings[sender]) warnings[sender] = 0;
             warnings[sender]++;
             if (warnings[sender] >= 3) {
               await sock.groupParticipantsUpdate(gid, [sender], 'remove');
-              await sock.sendMessage(gid, { text: '🚫 @' + sender.split('@')[0] + ' kicked for sharing adult content!', mentions: [sender] });
+              await sock.sendMessage(gid, {
+                text: '🚫 @' + sender.split('@')[0] + ' kicked for sharing adult content!',
+                mentions: [sender]
+              });
               warnings[sender] = 0;
             } else {
-              await sock.sendMessage(gid, { text: '🔞 @' + sender.split('@')[0] + ' adult content not allowed! Warning ' + warnings[sender] + '/3', mentions: [sender] });
+              await sock.sendMessage(gid, {
+                text: '🔞 @' + sender.split('@')[0] + ' adult content not allowed! Warning ' + warnings[sender] + '/3',
+                mentions: [sender]
+              });
             }
             continue;
           }
 
-          // Invite gate
+          // ── Invite gate ──
           if (!admin && !approvedUsers.has(sender)) {
             const cnt = inviteCount[sender] || 0;
             if (cnt < CONFIG.inviteGate) {
               await deleteMsg(sock, gid, msg);
               await sendMsg(sock, gid,
-                '⛔ @' + sender.split('@')[0] + ' add *' + (CONFIG.inviteGate - cnt) + ' more members* before chatting! (' + cnt + '/' + CONFIG.inviteGate + ')',
+                '⛔ @' + sender.split('@')[0] +
+                ' add *' + (CONFIG.inviteGate - cnt) +
+                ' more members* before chatting! (' + cnt + '/' + CONFIG.inviteGate + ')',
                 [sender]
               );
               continue;
@@ -584,47 +678,51 @@ const startBot = async () => {
             }
           }
 
-          // Anti-spam
+          // ── Anti-spam ──
           if (!admin && isSpam(sender)) {
             await deleteMsg(sock, gid, msg);
             await sendMsg(sock, gid, '⚠️ @' + sender.split('@')[0] + ' stop spamming!', [sender]);
             continue;
           }
 
-          // Anti-link
+          // ── Anti-link ──
           if (!admin && text && getLinks(text).length > CONFIG.maxLinks) {
             await deleteMsg(sock, gid, msg);
             await sendMsg(sock, gid, '🚫 @' + sender.split('@')[0] + ' too many links! Message deleted.', [sender]);
             continue;
           }
 
-          // Commands
+          // ── Commands ──
           if (text && text.startsWith(CONFIG.prefix)) {
             await handleCmd(sock, msg, text, gid, sender);
           }
 
+          // Register celebrations for this group (runs once per gid)
           setupCelebrations(sock, gid);
 
         } catch (e) {
-          console.log('Message error:', e.message);
+          // Log full error, not just message
+          process.stdout.write('Message handler error: ' + e.stack + '\n');
         }
       }
     });
 
   } catch (e) {
-    console.error('startBot error:', e.message);
-    console.log('Restarting in 10 seconds...');
+    isReconnecting = false;
+    process.stdout.write('startBot error: ' + e.stack + '\n');
+    process.stdout.write('Restarting in 10 seconds...\n');
     setTimeout(startBot, 10000);
   }
 };
 
 // ── CRASH RECOVERY ───────────────────────────────────────────
 process.on('uncaughtException', err => {
-  console.error('UNCAUGHT EXCEPTION:', err.message);
+  process.stdout.write('UNCAUGHT EXCEPTION: ' + err.stack + '\n');
 });
 
 process.on('unhandledRejection', err => {
-  console.error('UNHANDLED REJECTION:', err);
+  process.stdout.write('UNHANDLED REJECTION: ' + (err?.stack || err) + '\n');
 });
 
+// ── START ────────────────────────────────────────────────────
 startBot();
