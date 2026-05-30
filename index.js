@@ -52,49 +52,63 @@ try {
   process.stdout.write('Could not create session dir: ' + e.message + '\n');
 }
 
-// ── JID NORMALISATION ────────────────────────────────────────
-// WhatsApp now uses @lid (Linked ID) format in addition to @s.whatsapp.net.
-// Strip the device suffix and keep only number@domain so comparisons work
-// across both formats.
+// ── JID HELPERS ──────────────────────────────────────────────
+
+// Strip device suffix: "1234:5@s.whatsapp.net" → "1234@s.whatsapp.net"
 const normaliseJid = (jid) => {
   if (!jid) return '';
-  return jid.replace(/:.*@/, '@');   // "1234:5@s.whatsapp.net" → "1234@s.whatsapp.net"
+  return jid.replace(/:.*@/, '@');
+};
+
+// Extract only the numeric portion from any JID format.
+// "254718160377:9@s.whatsapp.net" → "254718160377"
+// "71314274566240@lid"            → "71314274566240"
+const phoneDigits = (jid) => {
+  if (!jid) return '';
+  return jid.replace(/:.*/, '').replace(/@.*/, '');
 };
 
 // ── HELPERS ──────────────────────────────────────────────────
 
 /**
  * Check whether `uid` is an admin of group `gid`.
- * Works for both @s.whatsapp.net and @lid JIDs.
+ * Matches by normalised JID first, then falls back to raw numeric match
+ * so @lid and @s.whatsapp.net participants both resolve correctly.
  */
 const isAdmin = async (sock, gid, uid) => {
   try {
     const g = await sock.groupMetadata(gid);
     if (!g || !g.participants) return false;
-    const uidNorm = normaliseJid(uid);
-    return g.participants.some(p => p.admin && normaliseJid(p.id) === uidNorm);
+    const uidNorm   = normaliseJid(uid);
+    const uidDigits = phoneDigits(uid);
+    return g.participants.some(p => {
+      if (!p.admin) return false;
+      return normaliseJid(p.id) === uidNorm ||
+             phoneDigits(p.id)  === uidDigits;
+    });
   } catch { return false; }
 };
 
 /**
  * Check whether the bot itself is an admin of group `gid`.
- * Compares against both the phone JID and the LID (if present) so the
- * lookup succeeds regardless of which format WhatsApp reports for the bot.
+ *
+ * Problem: WhatsApp now stores participants with @lid JIDs, but the bot's
+ * sock.user.id is a @s.whatsapp.net JID and sock.user.lid is often absent.
+ * Solution: compare purely by phone number digits, which are the same
+ * regardless of JID format.
  */
 const isBotAdmin = async (sock, gid) => {
   try {
     const g = await sock.groupMetadata(gid);
     if (!g || !g.participants) return false;
 
-    // Normalise the bot's known identities
-    const botPhoneNorm = sock.user?.id  ? normaliseJid(sock.user.id)  : null;
-    const botLidNorm   = sock.user?.lid ? normaliseJid(sock.user.lid) : null;
+    // Extract the bot's phone number from its JID (always available)
+    const botNumber = phoneDigits(sock.user?.id);
+    if (!botNumber) return false;
 
     return g.participants.some(p => {
       if (!p.admin) return false;
-      const pNorm = normaliseJid(p.id);
-      return (botPhoneNorm && pNorm === botPhoneNorm) ||
-             (botLidNorm   && pNorm === botLidNorm);
+      return phoneDigits(p.id) === botNumber;
     });
   } catch { return false; }
 };
