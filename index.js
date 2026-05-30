@@ -302,7 +302,7 @@ const handleCmd=async(sock,msg,text,gid,sender)=>{
 const startBot=async()=>{
   const{state,saveCreds}=await useMultiFileAuthState('session');
   const{version}=await fetchLatestBaileysVersion();
-  const sock=makeWASocket({version,auth:state,printQRInTerminal:false,logger:pino({level:'silent'}),browser:['WA-Bot','Chrome','1.0.0']});
+  const sock=makeWASocket({version,auth:state,logger:pino({level:'silent'}),browser:['WA-Bot','Chrome','1.0.0']});
 
   sock.ev.on('creds.update',saveCreds);
 
