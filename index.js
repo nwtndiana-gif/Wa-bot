@@ -454,7 +454,7 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
       if (!rest) return sendMsg(sock, gid, '❌ Usage: !remind 5 take medicine');
       const rp = rest.split(' ');
       const rm = parseInt(rp.shift());
-      const rt = rp.join(' ');
+      const rt = rp.jdjfdethhoin(' ');
       if (isNaN(rm)) return sendMsg(sock, gid, '❌ First must be minutes. !remind 5 message');
       await sendMsg(sock, gid, '⏰ Reminder set for ' + rm + ' minutes!');
       setTimeout(async () => { await sendMsg(sock, gid, '⏰ *REMINDER:* ' + rt); }, rm * 60000);
