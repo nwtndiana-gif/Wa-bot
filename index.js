@@ -14,7 +14,7 @@ const cron = require('node-cron');
 const { exec } = require('child_process');
 const fs = require('fs');
 const Groq = require('groq-sdk');
-const { createClient } = require('redis');
+// Using Upstash REST API for session persistence
 
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
 
@@ -42,19 +42,23 @@ let isReconnecting = false;
 let redisClient = null;
 
 // ── REDIS SESSION ─────────────────────────────────────────────
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
 const initRedis = async () => {
-  if (!process.env.REDIS_URL) {
-    process.stdout.write('No REDIS_URL, using local session\n');
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+    process.stdout.write('No Upstash credentials, using local session\n');
     return null;
   }
   try {
-    const client = createClient({ url: process.env.REDIS_URL });
-    client.on('error', e => process.stdout.write('Redis error: ' + e.message + '\n'));
-    await client.connect();
-    process.stdout.write('Redis connected\n');
-    return client;
+    // Test connection
+    const res = await axios.get(UPSTASH_URL + '/ping', {
+      headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN }
+    });
+    process.stdout.write('Upstash connected: ' + JSON.stringify(res.data) + '\n');
+    return true;
   } catch (e) {
-    process.stdout.write('Redis connect failed: ' + e.message + '\n');
+    process.stdout.write('Upstash connect failed: ' + e.message + '\n');
     return null;
   }
 };
@@ -62,14 +66,20 @@ const initRedis = async () => {
 const saveSessionToRedis = async (key, value) => {
   if (!redisClient) return;
   try {
-    await redisClient.set('wa_session_' + key, JSON.stringify(value));
+    await axios.post(UPSTASH_URL + '/set/wa_session_' + encodeURIComponent(key),
+      JSON.stringify(value),
+      { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' } }
+    );
   } catch (e) {}
 };
 
 const loadSessionFromRedis = async (key) => {
   if (!redisClient) return null;
   try {
-    const val = await redisClient.get('wa_session_' + key);
+    const res = await axios.get(UPSTASH_URL + '/get/wa_session_' + encodeURIComponent(key),
+      { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN } }
+    );
+    const val = res.data?.result;
     return val ? JSON.parse(val) : null;
   } catch (e) { return null; }
 };
@@ -507,9 +517,17 @@ const clearSession = async () => {
   } catch (_) {}
   if (redisClient) {
     try {
-      const keys = await redisClient.keys('wa_session_*');
-      for (const k of keys) await redisClient.del(k);
-      process.stdout.write('Redis session cleared\n');
+      // Clear all session keys via REST
+      const res = await axios.get(UPSTASH_URL + '/keys/wa_session_*',
+        { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN } }
+      );
+      const keys = res.data?.result || [];
+      for (const k of keys) {
+        await axios.get(UPSTASH_URL + '/del/' + encodeURIComponent(k),
+          { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN } }
+        );
+      }
+      process.stdout.write('Upstash session cleared\n');
     } catch (e) {}
   }
 };
@@ -553,6 +571,7 @@ const startBot = async () => {
     });
 
     sock.ev.on('creds.update', saveCreds);
+
 
     if (!state.creds.registered) {
       const rawNumber = (process.env.PAIRING_NUMBER || '254718160377').replace(/[^0-9]/g, '');
@@ -682,7 +701,7 @@ const startBot = async () => {
 process.on('uncaughtException', err => process.stdout.write('UNCAUGHT: ' + err.stack + '\n'));
 process.on('unhandledRejection', err => process.stdout.write('REJECTION: ' + (err?.stack || err) + '\n'));
 
-// ── HTTP KEEPALIVE (prevents Railway SIGTERM) ─────────────────
+// ── HTTP KEEPALIVE ────────────────────────────────────────────
 const http = require('http');
 http.createServer((req, res) => {
   res.writeHead(200);
