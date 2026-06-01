@@ -8,24 +8,28 @@ const {
   makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
 
-const pino = require('pino');
-const axios = require('axios');
-const cron = require('node-cron');
+const pino   = require('pino');
+const axios  = require('axios');
+const cron   = require('node-cron');
 const { exec } = require('child_process');
-const fs = require('fs');
-const Groq = require('groq-sdk');
-// Using Upstash REST API for session persistence
+const fs     = require('fs');
+const Groq   = require('groq-sdk');
 
-const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
+// ── GROQ ─────────────────────────────────────────────────────
+const groq = process.env.GROQ_API_KEY
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
+  : null;
 
+// ── CONFIG ───────────────────────────────────────────────────
 const CONFIG = {
-  prefix: '!',
-  inviteGate: 2,
-  maxLinks: 2,
-  spamLimit: 5,
-  spamWindow: 10000,
-  timezone: 'Africa/Nairobi',
-  sessionDir: './session'
+  prefix:         '!',
+  inviteGate:     2,
+  maxLinks:       2,
+  spamLimit:      5,
+  spamWindow:     10000,
+  timezone:       'Africa/Nairobi',
+  sessionDir:     './session',
+  metaCacheTTL:   5 * 60 * 1000   // 5 minutes in ms
 };
 
 const PORN_DOMAINS = [
@@ -33,142 +37,191 @@ const PORN_DOMAINS = [
   'redtube.com','youporn.com','spankbang.com','beeg.com'
 ];
 
-const inviteCount = {};
-const warnings = {};
-const spamTracker = {};
-const approvedUsers = new Set();
-const celebDone = new Set();
-let isReconnecting = false;
-let redisClient = null;
+// ── STATE ────────────────────────────────────────────────────
+const inviteCount    = {};
+const warnings       = {};
+const spamTracker    = {};
+const approvedUsers  = new Set();
+const celebDone      = new Set();
+let   isReconnecting = false;
 
-// ── REDIS SESSION ─────────────────────────────────────────────
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+// ── GROUP METADATA CACHE ──────────────────────────────────────
+// Keyed by gid → { participants, fetchedAt }
+// This avoids hammering WhatsApp with groupMetadata() on every message.
+const metaCache = {};
 
-const initRedis = async () => {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) {
-    process.stdout.write('No Upstash credentials, using local session\n');
-    return null;
+const getCachedMeta = async (sock, gid) => {
+  const now = Date.now();
+  if (metaCache[gid] && (now - metaCache[gid].fetchedAt) < CONFIG.metaCacheTTL) {
+    return metaCache[gid].data;
+  }
+  const data = await sock.groupMetadata(gid);
+  metaCache[gid] = { data, fetchedAt: now };
+  return data;
+};
+
+// Call this after any admin change so the cache doesn't serve stale data.
+const invalidateCache = (gid) => { delete metaCache[gid]; };
+
+// ── SESSION DIRECTORY & PERSISTENCE ──────────────────────────
+// Railway wipes the filesystem on every redeploy, so session files are lost
+// and the bot needs re-pairing each time. The fix: encode the session folder
+// as a Base64 JSON string stored in a Railway environment variable called
+// SESSION_DATA. On startup we restore it; after every creds update we
+// re-encode and log it (and optionally push it back via the Railway API).
+//
+// SETUP (one-time):
+//   1. Deploy and pair the bot once.
+//   2. Copy the "SESSION_SAVED=..." line from the Railway logs.
+//   3. In Railway → your service → Variables, add:
+//        SESSION_DATA = <the base64 string you copied>
+//   4. For automatic saving add these three Railway vars too:
+//        RAILWAY_TOKEN            = your Railway API token
+//        RAILWAY_PROJECT_ID       = your project ID (service settings)
+//        RAILWAY_SERVICE_ID       = your service ID (service settings)
+//   After that, redeploys will restore the session automatically.
+
+try {
+  fs.mkdirSync(CONFIG.sessionDir, { recursive: true });
+  process.stdout.write('Session directory ready: ' + CONFIG.sessionDir + '\n');
+} catch (e) {
+  process.stdout.write('Could not create session dir: ' + e.message + '\n');
+}
+
+const restoreSession = () => {
+  const raw = process.env.SESSION_DATA;
+  if (!raw) {
+    process.stdout.write('No SESSION_DATA env var found — fresh session.\n');
+    return;
   }
   try {
-    // Test connection
-    const res = await axios.get(UPSTASH_URL + '/ping', {
-      headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN }
-    });
-    process.stdout.write('Upstash connected: ' + JSON.stringify(res.data) + '\n');
-    return true;
+    const files = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
+    for (const [name, content] of Object.entries(files)) {
+      fs.writeFileSync(CONFIG.sessionDir + '/' + name, content, 'utf8');
+    }
+    process.stdout.write('Session restored from SESSION_DATA ✅\n');
   } catch (e) {
-    process.stdout.write('Upstash connect failed: ' + e.message + '\n');
-    return null;
+    process.stdout.write('Session restore failed (bad SESSION_DATA?): ' + e.message + '\n');
   }
 };
+restoreSession();
 
-const saveSessionToRedis = async (key, value) => {
-  if (!redisClient) return;
+const saveSessionToEnv = async () => {
   try {
-    await axios.post(UPSTASH_URL + '/set/wa_session_' + encodeURIComponent(key),
-      JSON.stringify(value),
-      { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' } }
-    );
-  } catch (e) {}
-};
-
-const loadSessionFromRedis = async (key) => {
-  if (!redisClient) return null;
-  try {
-    const res = await axios.get(UPSTASH_URL + '/get/wa_session_' + encodeURIComponent(key),
-      { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN } }
-    );
-    const val = res.data?.result;
-    return val ? JSON.parse(val) : null;
-  } catch (e) { return null; }
-};
-
-// ── REDIS-BACKED AUTH STATE ───────────────────────────────────
-const useRedisAuthState = async () => {
-  // Load creds from Redis or use empty
-  let creds = await loadSessionFromRedis('creds');
-  if (!creds) {
-    const { initAuthCreds } = require('@whiskeysockets/baileys');
-    creds = initAuthCreds();
-  }
-
-  const keys = {};
-
-  const state = {
-    creds,
-    keys: {
-      get: async (type, ids) => {
-        const data = {};
-        for (const id of ids) {
-          const val = await loadSessionFromRedis(type + '_' + id);
-          if (val) data[id] = val;
-        }
-        return data;
-      },
-      set: async (data) => {
-        for (const [type, typeData] of Object.entries(data)) {
-          for (const [id, value] of Object.entries(typeData || {})) {
-            if (value) {
-              await saveSessionToRedis(type + '_' + id, value);
-            } else {
-              if (redisClient) await redisClient.del('wa_session_' + type + '_' + id);
-            }
-          }
-        }
+    const dir   = CONFIG.sessionDir;
+    const files = {};
+    for (const name of fs.readdirSync(dir)) {
+      const full = dir + '/' + name;
+      if (fs.statSync(full).isFile()) {
+        files[name] = fs.readFileSync(full, 'utf8');
       }
     }
-  };
+    const encoded = Buffer.from(JSON.stringify(files)).toString('base64');
 
-  const saveCreds = async () => {
-    await saveSessionToRedis('creds', state.creds);
-  };
+    // Always print it — copy this from logs if you need to set SESSION_DATA manually
+    process.stdout.write('SESSION_SAVED=' + encoded + '\n');
 
-  return { state, saveCreds };
+    // Auto-push to Railway if credentials are provided
+    const token     = process.env.RAILWAY_TOKEN;
+    const serviceId = process.env.RAILWAY_SERVICE_ID;
+    const projectId = process.env.RAILWAY_PROJECT_ID;
+    const envName   = process.env.RAILWAY_ENVIRONMENT_NAME || 'production';
+
+    if (token && serviceId && projectId) {
+      await axios.post(
+        'https://backboard.railway.app/graphql/v2',
+        {
+          query: `mutation UpsertEnvVar($input: VariableCollectionUpsertInput!) {
+            variableCollectionUpsert(input: $input)
+          }`,
+          variables: {
+            input: {
+              projectId,
+              serviceId,
+              environmentName: envName,
+              variables: { SESSION_DATA: encoded }
+            }
+          }
+        },
+        { headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' } }
+      ).catch(e => process.stdout.write('Railway API save error: ' + e.message + '\n'));
+      process.stdout.write('Session auto-saved to Railway ✅\n');
+    }
+  } catch (e) {
+    process.stdout.write('saveSessionToEnv error: ' + e.message + '\n');
+  }
 };
 
-// ── HELPERS ───────────────────────────────────────────────────
+// ── HELPERS ──────────────────────────────────────────────────
+
+// Strip device suffix so @s.whatsapp.net and @lid JIDs can be compared.
+const normaliseJid = (jid) => {
+  if (!jid) return '';
+  return jid.replace(/:.*@/, '@').toLowerCase();
+};
+
 const isAdmin = async (sock, gid, uid) => {
   try {
-    const g = await sock.groupMetadata(gid);
-    return g.participants.filter(p => p.admin).map(p => p.id).includes(uid);
+    const g    = await getCachedMeta(sock, gid);
+    const uidN = normaliseJid(uid);
+    return g.participants
+      .filter(p => p.admin)
+      .some(p => normaliseJid(p.id) === uidN);
   } catch { return false; }
 };
 
-const isBotAdmin = async (sock, gid) => {
-  try {
-    if (!sock.user || !sock.user.id) return false;
-    const g = await sock.groupMetadata(gid);
-    const botJid = sock.user.id.replace(/:.*@/, '@');
-    const botLid = sock.user.lid ? sock.user.lid.replace(/:.*@/, '@') : null;
-    const admins = g.participants.filter(p => p.admin).map(p => p.id.replace(/:.*@/, '@'));
-    const result = admins.includes(botJid) || (botLid && admins.includes(botLid));
-    return result === true;
-  } catch (e) {
-    process.stdout.write('isBotAdmin error: ' + e.message + '\n');
-    return false;
+const isBotAdmin = async (sock, gid, retries = 3) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const g      = await getCachedMeta(sock, gid);
+      const botJid = normaliseJid(sock.user.id);
+      const botLid = sock.user.lid ? normaliseJid(sock.user.lid) : null;
+      return g.participants
+        .filter(p => p.admin)
+        .some(p => {
+          const pid = normaliseJid(p.id);
+          return pid === botJid || (botLid && pid === botLid);
+        });
+    } catch (e) {
+      process.stdout.write('isBotAdmin attempt ' + (i + 1) + ' failed: ' + e.message + '\n');
+      if (i < retries - 1) {
+        invalidateCache(gid); // force a fresh fetch on retry
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
   }
+  return false;
 };
 
 const sendMsg = async (sock, jid, text, mentions) => {
   try {
     await sock.sendMessage(jid, { text, ...(mentions && { mentions }) });
-  } catch (e) { process.stdout.write('sendMsg error: ' + e.message + '\n'); }
+  } catch (e) {
+    process.stdout.write('sendMsg error: ' + e.message + '\n');
+  }
 };
 
 const deleteMsg = async (sock, jid, msg) => {
   try {
     await sock.sendMessage(jid, {
-      delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: msg.key.participant }
+      delete: {
+        remoteJid:   jid,
+        fromMe:      false,
+        id:          msg.key.id,
+        participant: msg.key.participant
+      }
     });
   } catch (_) {}
 };
 
-const getLinks = (text) => text.match(/(https?:\/\/[^\s]+)|(www\.[^\s]+)/gi) || [];
+const getLinks = (text) =>
+  text.match(/(https?:\/\/[^\s]+)|(www\.[^\s]+)/gi) || [];
 
 const hasPornLink = (text) => {
   const links = getLinks(text);
-  return links.some(link => PORN_DOMAINS.some(d => link.toLowerCase().includes(d)));
+  return links.some(link =>
+    PORN_DOMAINS.some(d => link.toLowerCase().includes(d))
+  );
 };
 
 const isSpam = (uid) => {
@@ -184,48 +237,61 @@ const askAI = async (q) => {
   try {
     const r = await groq.chat.completions.create({
       messages: [{ role: 'user', content: q }],
-      model: 'llama3-8b-8192'
+      model:    'llama3-70b-8192'
     });
     return r.choices[0]?.message?.content || 'No response';
-  } catch (e) { return 'AI error: ' + e.message; }
+  } catch (e) {
+    return 'AI error: ' + e.message;
+  }
 };
 
-// ── CELEBRATIONS ──────────────────────────────────────────────
+// ── CELEBRATIONS ─────────────────────────────────────────────
+
 const setupCelebrations = (sock, gid) => {
   if (celebDone.has(gid)) return;
   celebDone.add(gid);
+
   cron.schedule('0 0 1 1 *', async () => {
     await sendMsg(sock, gid, '🎆 *HAPPY NEW YEAR!* 🎆\n\nWishing everyone an amazing New Year! 🥂✨');
   }, { timezone: CONFIG.timezone });
+
   cron.schedule('0 0 25 12 *', async () => {
     await sendMsg(sock, gid, '🎄 *MERRY CHRISTMAS!* 🎄\n\nWishing you joy and blessings! 🎁⭐');
   }, { timezone: CONFIG.timezone });
+
   cron.schedule('0 8 * * *', async () => {
     const now = new Date();
     const m = now.getMonth() + 1;
     const d = now.getDate();
     if (m === 10 && d === 20) await sendMsg(sock, gid, '🇰🇪 *HAPPY MASHUJAA DAY!* 🇰🇪\n\nHonoring our heroes! 🦁⚔️');
-    if (m === 6 && d === 1) await sendMsg(sock, gid, '🇰🇪 *HAPPY MADARAKA DAY!* 🇰🇪\n\nTujivunie kuwa Wakenya! 🕊️');
+    if (m === 6  && d === 1)  await sendMsg(sock, gid, '🇰🇪 *HAPPY MADARAKA DAY!* 🇰🇪\n\nTujivunie kuwa Wakenya! 🕊️');
     if (m === 12 && d === 12) await sendMsg(sock, gid, '🇰🇪 *HAPPY JAMHURI DAY!* 🇰🇪\n\nProud to be Kenyan! 🎉');
-    if (m === 5 && d === 1) await sendMsg(sock, gid, '🇰🇪 *HAPPY LABOUR DAY!* 🇰🇪\n\nHonoring all hardworking Kenyans! 💪');
+    if (m === 5  && d === 1)  await sendMsg(sock, gid, '🇰🇪 *HAPPY LABOUR DAY!* 🇰🇪\n\nHonoring all hardworking Kenyans! 💪');
     if (m === 10 && d === 10) await sendMsg(sock, gid, '🇰🇪 *HAPPY UTAMADUNI DAY!* 🇰🇪\n\nUmoja ni nguvu! 🎭');
-    if ((m === 4 && d === 10) || (m === 3 && d === 30)) await sendMsg(sock, gid, '☪️ *EID MUBARAK!* ☪️\n\nBlessed Eid! 🌙🤲');
-    if ((m === 6 && d === 16) || (m === 6 && d === 17)) await sendMsg(sock, gid, '☪️ *EID UL ADHA MUBARAK!* ☪️\n\nMay Allah accept your sacrifices! 🌙🤲');
-    if (m === 11 && d === 1) await sendMsg(sock, gid, '🪔 *HAPPY DIWALI!* 🪔\n\nFestival of lights! ✨');
+    if ((m === 4 && d === 10) || (m === 3 && d === 30))
+      await sendMsg(sock, gid, '☪️ *EID MUBARAK!* ☪️\n\nBlessed Eid to all Muslims! 🌙🤲');
+    if ((m === 6 && d === 16) || (m === 6 && d === 17))
+      await sendMsg(sock, gid, '☪️ *EID UL ADHA MUBARAK!* ☪️\n\nMay Allah accept your sacrifices! 🌙🤲');
+    if (m === 11 && d === 1)  await sendMsg(sock, gid, '🪔 *HAPPY DIWALI!* 🪔\n\nFestival of lights! ✨');
   }, { timezone: CONFIG.timezone });
 };
 
-// ── COMMANDS ──────────────────────────────────────────────────
+// ── COMMANDS ─────────────────────────────────────────────────
+
 const handleCmd = async (sock, msg, text, gid, sender) => {
   const botAdmin = await isBotAdmin(sock, gid);
-  if (botAdmin !== true) return;
-  const args = text.slice(CONFIG.prefix.length).trim().split(' ');
-  const cmd = args.shift().toLowerCase();
-  const rest = args.join(' ');
-  const admin = await isAdmin(sock, gid, sender);
+  if (!botAdmin) return;
+
+  const args      = text.slice(CONFIG.prefix.length).trim().split(/\s+/);
+  const cmd       = args.shift().toLowerCase();
+  const rest      = args.join(' ');
+  const admin     = await isAdmin(sock, gid, sender);
   const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
 
+  process.stdout.write('[CMD] cmd=' + cmd + ' sender=' + sender + '\n');
+
   switch (cmd) {
+
     case 'menu':
       await sendMsg(sock, gid,
 `╔══════════════════════╗
@@ -253,7 +319,8 @@ const handleCmd = async (sock, msg, text, gid, sender) => {
 !translate [lang] [text]
 !calculate [expr]
 !remind [mins] [msg]
-!news  !time
+!news
+!time
 
 🎵 *MEDIA*
 !song / !video [name]
@@ -273,7 +340,7 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
 
     case 'joke':
       try {
-        const j = await axios.get('https://v2.jokeapi.dev/joke/Any?safe-mode');
+        const j  = await axios.get('https://v2.jokeapi.dev/joke/Any?safe-mode');
         const jd = j.data;
         await sendMsg(sock, gid, jd.type === 'single' ? jd.joke : jd.setup + '\n\n😂 ' + jd.delivery);
       } catch { await sendMsg(sock, gid, '😂 Why did the bot crash? Too many requests!'); }
@@ -323,7 +390,11 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
       try {
         const c = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd');
         const d = c.data;
-        await sendMsg(sock, gid, '💰 *Crypto Prices*\n\n₿ BTC: $' + d.bitcoin.usd.toLocaleString() + '\nΞ ETH: $' + d.ethereum.usd.toLocaleString() + '\n◎ SOL: $' + d.solana.usd.toLocaleString());
+        await sendMsg(sock, gid,
+          '💰 *Crypto Prices*\n\n' +
+          '₿ BTC: $' + d.bitcoin.usd.toLocaleString() + '\n' +
+          'Ξ ETH: $' + d.ethereum.usd.toLocaleString() + '\n' +
+          '◎ SOL: $' + d.solana.usd.toLocaleString());
       } catch { await sendMsg(sock, gid, '❌ Could not fetch prices'); }
       break;
 
@@ -340,7 +411,8 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
     case 'roast':
       if (!mentioned.length) return sendMsg(sock, gid, '❌ Tag someone to roast!');
       await sock.sendMessage(gid, {
-        text: '🔥 @' + mentioned[0].split('@')[0] + ' ' + await askAI('Give a funny harmless roast for ' + mentioned[0].split('@')[0] + '. Keep it light.'),
+        text: '🔥 @' + mentioned[0].split('@')[0] + ' ' +
+          await askAI('Give a funny harmless roast for ' + mentioned[0].split('@')[0] + '. Keep it light.'),
         mentions: mentioned
       });
       break;
@@ -350,7 +422,9 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
       {
         const pct = Math.floor(Math.random() * 100) + 1;
         await sock.sendMessage(gid, {
-          text: '💕 @' + mentioned[0].split('@')[0] + ' + @' + mentioned[1].split('@')[0] + '\n\n❤️ ' + pct + '% compatible!\n\n' + (pct > 70 ? '🔥 Perfect match!' : pct > 40 ? '💛 Good potential!' : '💔 Not great...'),
+          text: '💕 @' + mentioned[0].split('@')[0] + ' + @' + mentioned[1].split('@')[0] +
+            '\n\n❤️ ' + pct + '% compatible!\n\n' +
+            (pct > 70 ? '🔥 Perfect match!' : pct > 40 ? '💛 Good potential!' : '💔 Not great...'),
           mentions: mentioned
         });
       }
@@ -361,6 +435,7 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
       if (!mentioned.length) return sendMsg(sock, gid, '❌ Tag someone!');
       await sock.groupParticipantsUpdate(gid, mentioned, 'remove');
       await sendMsg(sock, gid, '✅ Kicked ' + mentioned.length + ' member(s)');
+      invalidateCache(gid);
       break;
 
     case 'ban':
@@ -368,6 +443,7 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
       if (!mentioned.length) return sendMsg(sock, gid, '❌ Tag someone!');
       await sock.groupParticipantsUpdate(gid, mentioned, 'remove');
       await sendMsg(sock, gid, '🚫 Banned ' + mentioned.length + ' member(s)');
+      invalidateCache(gid);
       break;
 
     case 'mute':
@@ -392,6 +468,7 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
         await sock.groupParticipantsUpdate(gid, [wu], 'remove');
         await sock.sendMessage(gid, { text: '🚫 @' + wu.split('@')[0] + ' kicked after 3 warnings!', mentions: [wu] });
         warnings[wu] = 0;
+        invalidateCache(gid);
       } else {
         await sock.sendMessage(gid, { text: '⚠️ Warning ' + warnings[wu] + '/3 for @' + wu.split('@')[0], mentions: [wu] });
       }
@@ -402,20 +479,26 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
       if (!admin) return sendMsg(sock, gid, '❌ Admins only!');
       if (!mentioned.length) return sendMsg(sock, gid, '❌ Tag someone!');
       for (const u of mentioned) { approvedUsers.add(u); inviteCount[u] = CONFIG.inviteGate; }
-      await sock.sendMessage(gid, { text: '✅ Approved ' + mentioned.map(u => '@' + u.split('@')[0]).join(', ') + ' to chat!', mentions: mentioned });
+      await sock.sendMessage(gid, {
+        text: '✅ Approved ' + mentioned.map(u => '@' + u.split('@')[0]).join(', ') + ' to chat!',
+        mentions: mentioned
+      });
       break;
 
     case 'unapprove':
       if (!admin) return sendMsg(sock, gid, '❌ Admins only!');
       if (!mentioned.length) return sendMsg(sock, gid, '❌ Tag someone!');
       for (const u of mentioned) { approvedUsers.delete(u); inviteCount[u] = 0; }
-      await sock.sendMessage(gid, { text: '❌ Unapproved ' + mentioned.map(u => '@' + u.split('@')[0]).join(', '), mentions: mentioned });
+      await sock.sendMessage(gid, {
+        text: '❌ Unapproved ' + mentioned.map(u => '@' + u.split('@')[0]).join(', '),
+        mentions: mentioned
+      });
       break;
 
     case 'tagall':
       if (!admin) return sendMsg(sock, gid, '❌ Admins only!');
       try {
-        const grp = await sock.groupMetadata(gid);
+        const grp = await getCachedMeta(sock, gid);
         const mbs = grp.participants.map(p => p.id);
         await sock.sendMessage(gid, {
           text: '📢 ' + (rest || 'Attention everyone!') + '\n\n' + mbs.map(m => '@' + m.split('@')[0]).join(' '),
@@ -448,7 +531,8 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
     }
 
     case 'news':
-      await sendMsg(sock, gid, '📰 *Latest News*\n\n' + await askAI('Give me 5 latest world news headlines today in brief. Number them.'));
+      await sendMsg(sock, gid, '📰 *Latest News*\n\n' +
+        await askAI('Give me 5 latest world news headlines today in brief. Number them.'));
       break;
 
     case 'remind': {
@@ -465,13 +549,18 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
     case 'song':
       if (!rest) return sendMsg(sock, gid, '❌ Usage: !song song name');
       await sendMsg(sock, gid, '🎵 Downloading: ' + rest + '...');
-      exec('yt-dlp -x --audio-format mp3 -o "/tmp/%(title)s.%(ext)s" "ytsearch1:' + rest + '"', async (err) => {
-        if (err) return sendMsg(sock, gid, '❌ Download failed');
+      exec('yt-dlp -x --audio-format mp3 --no-playlist -o "/tmp/%(title)s.%(ext)s" "ytsearch1:' + rest + '"', async (err, stdout, stderr) => {
+        if (err) {
+          process.stdout.write('Song download error: ' + stderr + '\n');
+          return sendMsg(sock, gid, '❌ Download failed: ' + (stderr || err.message).slice(0, 100));
+        }
         const files = fs.readdirSync('/tmp').filter(f => f.endsWith('.mp3'));
         if (files.length) {
           const file = '/tmp/' + files[files.length - 1];
           await sock.sendMessage(gid, { audio: fs.readFileSync(file), mimetype: 'audio/mpeg' });
           fs.unlinkSync(file);
+        } else {
+          await sendMsg(sock, gid, '❌ Download finished but file not found');
         }
       });
       break;
@@ -479,13 +568,18 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
     case 'video':
       if (!rest) return sendMsg(sock, gid, '❌ Usage: !video video name');
       await sendMsg(sock, gid, '🎬 Downloading: ' + rest + '...');
-      exec('yt-dlp -f "best[filesize<50M]" -o "/tmp/%(title)s.%(ext)s" "ytsearch1:' + rest + '"', async (err) => {
-        if (err) return sendMsg(sock, gid, '❌ Download failed');
+      exec('yt-dlp -f "best[filesize<50M]" --no-playlist -o "/tmp/%(title)s.%(ext)s" "ytsearch1:' + rest + '"', async (err, stdout, stderr) => {
+        if (err) {
+          process.stdout.write('Video download error: ' + stderr + '\n');
+          return sendMsg(sock, gid, '❌ Download failed: ' + (stderr || err.message).slice(0, 100));
+        }
         const files = fs.readdirSync('/tmp').filter(f => f.endsWith('.mp4'));
         if (files.length) {
           const file = '/tmp/' + files[files.length - 1];
           await sock.sendMessage(gid, { video: fs.readFileSync(file), mimetype: 'video/mp4' });
           fs.unlinkSync(file);
+        } else {
+          await sendMsg(sock, gid, '❌ Download finished but file not found');
         }
       });
       break;
@@ -504,35 +598,28 @@ Porn filter | Invite gate (add ${CONFIG.inviteGate})`);
 
     case 'lyrics':
       if (!rest) return sendMsg(sock, gid, '❌ Usage: !lyrics song name');
-      await sendMsg(sock, gid, '🎵 *' + rest + '*\n\n' + await askAI('Describe the theme and meaning of the song "' + rest + '". Do not reproduce actual lyrics.'));
+      await sendMsg(sock, gid, '🎵 *' + rest + '*\n\n' +
+        await askAI('Describe the theme and meaning of the song "' + rest + '". Do not reproduce actual lyrics.'));
+      break;
+
+    default:
+      // Unknown command — silently ignore
       break;
   }
 };
 
-// ── CLEAR SESSION ─────────────────────────────────────────────
-const clearSession = async () => {
+// ── SAFE SESSION DELETE ───────────────────────────────────────
+const clearSession = () => {
   try {
     fs.rmSync(CONFIG.sessionDir, { recursive: true, force: true });
     fs.mkdirSync(CONFIG.sessionDir, { recursive: true });
-  } catch (_) {}
-  if (redisClient) {
-    try {
-      // Clear all session keys via REST
-      const res = await axios.get(UPSTASH_URL + '/keys/wa_session_*',
-        { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN } }
-      );
-      const keys = res.data?.result || [];
-      for (const k of keys) {
-        await axios.get(UPSTASH_URL + '/del/' + encodeURIComponent(k),
-          { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN } }
-        );
-      }
-      process.stdout.write('Upstash session cleared\n');
-    } catch (e) {}
+    process.stdout.write('Session cleared.\n');
+  } catch (e) {
+    process.stdout.write('clearSession error: ' + e.message + '\n');
   }
 };
 
-// ── MAIN BOT ──────────────────────────────────────────────────
+// ── MAIN BOT ─────────────────────────────────────────────────
 const startBot = async () => {
   if (isReconnecting) return;
   isReconnecting = true;
@@ -540,68 +627,69 @@ const startBot = async () => {
   try {
     fs.mkdirSync(CONFIG.sessionDir, { recursive: true });
 
-    // Use Redis auth if available, else fallback to file
-    let state, saveCreds;
-    if (redisClient) {
-      process.stdout.write('Using Redis session\n');
-      const redisAuth = await useRedisAuthState();
-      state = redisAuth.state;
-      saveCreds = redisAuth.saveCreds;
-    } else {
-      process.stdout.write('Using file session\n');
-      const fileAuth = await useMultiFileAuthState(CONFIG.sessionDir);
-      state = fileAuth.state;
-      saveCreds = fileAuth.saveCreds;
-    }
+    const { state, saveCreds } = await useMultiFileAuthState(CONFIG.sessionDir);
+    const { version }          = await fetchLatestBaileysVersion();
 
-    const { version } = await fetchLatestBaileysVersion();
     process.stdout.write('Baileys version: ' + version.join('.') + '\n');
 
     const sock = makeWASocket({
       version,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+        // warn level suppresses verbose session/key debug output
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'warn' }))
       },
       printQRInTerminal: false,
-      logger: pino({ level: 'silent' }),
-      browser: ['Ubuntu', 'Chrome', '20.0.04'],
-      syncFullHistory: false,
+      logger:            pino({ level: 'warn' }),   // was 'silent' — warn is better for real errors
+      browser:           ['Ubuntu', 'Chrome', '20.0.04'],
+      syncFullHistory:   false,
       markOnlineOnConnect: false
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+      await saveCreds();
+      await saveSessionToEnv();
+    });
 
-
+    // ── PAIRING CODE ──────────────────────────────────────────
     if (!state.creds.registered) {
-      const rawNumber = (process.env.PAIRING_NUMBER || '254718160377').replace(/[^0-9]/g, '');
-      process.stdout.write('Requesting pairing code for: ' + rawNumber + '\n');
+      const rawNumber = (process.env.PAIRING_NUMBER || '254718160377')
+        .replace(/[^0-9]/g, '');
+
+      process.stdout.write('Not registered. Requesting pairing code for: ' + rawNumber + '\n');
+
       setTimeout(async () => {
         try {
           const code = await sock.requestPairingCode(rawNumber);
-          if (!code) throw new Error('Empty pairing code');
+          if (!code) throw new Error('Received empty pairing code');
           const formatted = String(code).match(/.{1,4}/g).join('-');
           process.stdout.write('\n==============================\n');
           process.stdout.write('PAIRING CODE: ' + formatted + '\n');
           process.stdout.write('==============================\n');
-          process.stdout.write('WhatsApp Business > Linked Devices > Link with phone number\n\n');
+          process.stdout.write('WhatsApp > Linked Devices > Link a Device > Link with phone number\n\n');
         } catch (e) {
-          process.stdout.write('Pairing error: ' + e.message + '\n');
+          process.stdout.write('Pairing code error: ' + e.message + '\n');
+          process.stdout.write('Will retry on next restart.\n');
         }
       }, 3000);
     }
 
+    // ── CONNECTION UPDATES ────────────────────────────────────
     sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
       isReconnecting = false;
+
       if (connection === 'open') {
         process.stdout.write('✅ Bot connected to WhatsApp!\n');
       }
+
       if (connection === 'close') {
-        const code = lastDisconnect?.error?.output?.statusCode;
-        process.stdout.write('Connection closed. Code: ' + code + '\n');
-        if (code === DisconnectReason.loggedOut || code === 401) {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        process.stdout.write('Connection closed. Code: ' + statusCode + '\n');
+
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
           process.stdout.write('Session invalid. Clearing and restarting...\n');
-          clearSession().then(() => setTimeout(startBot, 5000));
+          clearSession();
+          setTimeout(startBot, 5000);
         } else {
           process.stdout.write('Reconnecting in 5 seconds...\n');
           setTimeout(startBot, 5000);
@@ -609,84 +697,141 @@ const startBot = async () => {
       }
     });
 
+    // ── NEW MEMBERS ───────────────────────────────────────────
     sock.ev.on('group-participants.update', async ({ id, participants, action, author }) => {
+      // Invalidate cache whenever membership changes
+      invalidateCache(id);
+
       if (action !== 'add') return;
+
       const botAdmin = await isBotAdmin(sock, id);
-      if (botAdmin !== true) return;
+      if (!botAdmin) return;
+
+      // Credit whoever added the members toward their invite gate count
       if (author) {
         if (!inviteCount[author]) inviteCount[author] = 0;
         inviteCount[author] += participants.length;
+
         if (inviteCount[author] >= CONFIG.inviteGate && !approvedUsers.has(author)) {
           approvedUsers.add(author);
-          await sendMsg(sock, id, '✅ @' + author.split('@')[0] + ' has added ' + inviteCount[author] + ' members and is now approved to chat! 🎉', [author]);
+          await sendMsg(sock, id,
+            '✅ @' + author.split('@')[0] + ' has added ' + inviteCount[author] +
+            ' members and is now approved to chat! 🎉',
+            [author]
+          );
         }
       }
+
+      // Welcome each new member — no gate instructions yet.
+      // The gate reminder only fires the first time they actually send a message.
       for (const p of participants) {
         inviteCount[p] = inviteCount[p] || 0;
-        await sendMsg(sock, id, '👋 Welcome @' + p.split('@')[0] + '!\n\nTo unlock chatting you must *add ' + CONFIG.inviteGate + ' members* directly to this group!\n\nType !menu after approval ✅', [p]);
+        await sendMsg(sock, id,
+          '👋 Welcome @' + p.split('@')[0] + '! Glad to have you here. 🎉',
+          [p]
+        );
       }
     });
 
+    // ── MESSAGES ─────────────────────────────────────────────
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
+
       for (const msg of messages) {
         try {
           if (!msg.message || msg.key.fromMe) continue;
+
           const gid = msg.key.remoteJid;
           if (!gid || !gid.endsWith('@g.us')) continue;
+
           const sender = msg.key.participant;
           if (!sender) continue;
-          const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
-          const admin = await isAdmin(sock, gid, sender);
-          const botAdmin = await isBotAdmin(sock, gid);
-          process.stdout.write('[MSG] gid=' + gid + ' botAdmin=' + botAdmin + ' text=' + (text || '[no text]') + '\n');
-          if (botAdmin !== true) continue;
 
+          // Extract text from common message types
+          const text =
+            msg.message?.conversation ||
+            msg.message?.extendedTextMessage?.text ||
+            msg.message?.imageMessage?.caption ||
+            msg.message?.videoMessage?.caption || '';
+
+          const botAdmin = await isBotAdmin(sock, gid);
+
+          process.stdout.write(
+            '[MSG] gid=' + gid + ' sender=' + sender +
+            ' botAdmin=' + botAdmin + ' text=' + (text || '[no text]') + '\n'
+          );
+
+          // Bot must be admin to do anything
+          if (!botAdmin) continue;
+
+          const admin = await isAdmin(sock, gid, sender);
+
+          // ── Porn filter ──
           if (text && hasPornLink(text)) {
             await deleteMsg(sock, gid, msg);
             if (!warnings[sender]) warnings[sender] = 0;
             warnings[sender]++;
             if (warnings[sender] >= 3) {
               await sock.groupParticipantsUpdate(gid, [sender], 'remove');
-              await sock.sendMessage(gid, { text: '🚫 @' + sender.split('@')[0] + ' kicked for sharing adult content!', mentions: [sender] });
+              await sock.sendMessage(gid, {
+                text: '🚫 @' + sender.split('@')[0] + ' kicked for sharing adult content!',
+                mentions: [sender]
+              });
               warnings[sender] = 0;
+              invalidateCache(gid);
             } else {
-              await sock.sendMessage(gid, { text: '🔞 @' + sender.split('@')[0] + ' adult content not allowed! Warning ' + warnings[sender] + '/3', mentions: [sender] });
+              await sock.sendMessage(gid, {
+                text: '🔞 @' + sender.split('@')[0] + ' adult content not allowed! Warning ' + warnings[sender] + '/3',
+                mentions: [sender]
+              });
             }
             continue;
           }
 
-          if (!admin && !approvedUsers.has(sender)) {
+          // ── Invite gate ──
+          // Only enforce if the sender actually sent a text message.
+          // Skipping media-only messages prevents the bot spamming the gate
+          // reminder every time someone shares a photo/sticker/voice note.
+          if (text && !admin && !approvedUsers.has(sender)) {
             const cnt = inviteCount[sender] || 0;
             if (cnt < CONFIG.inviteGate) {
               await deleteMsg(sock, gid, msg);
-              await sendMsg(sock, gid, '⛔ @' + sender.split('@')[0] + ' add *' + (CONFIG.inviteGate - cnt) + ' more members* before chatting! (' + cnt + '/' + CONFIG.inviteGate + ')', [sender]);
+              await sendMsg(sock, gid,
+                '⛔ @' + sender.split('@')[0] +
+                ' add *' + (CONFIG.inviteGate - cnt) +
+                ' more members* before chatting! (' + cnt + '/' + CONFIG.inviteGate + ')',
+                [sender]
+              );
               continue;
             } else {
               approvedUsers.add(sender);
             }
           }
 
-          if (!admin && isSpam(sender)) {
+          // ── Anti-spam ── (only for text messages)
+          if (text && !admin && isSpam(sender)) {
             await deleteMsg(sock, gid, msg);
             await sendMsg(sock, gid, '⚠️ @' + sender.split('@')[0] + ' stop spamming!', [sender]);
             continue;
           }
 
-          if (!admin && text && getLinks(text).length > CONFIG.maxLinks) {
+          // ── Anti-link ── (only for text messages)
+          if (text && !admin && getLinks(text).length > CONFIG.maxLinks) {
             await deleteMsg(sock, gid, msg);
             await sendMsg(sock, gid, '🚫 @' + sender.split('@')[0] + ' too many links! Message deleted.', [sender]);
             continue;
           }
 
+          // ── Commands ──
           if (text && text.startsWith(CONFIG.prefix)) {
             await handleCmd(sock, msg, text, gid, sender);
           }
 
+          // Register celebrations for this group (runs once per gid)
           setupCelebrations(sock, gid);
 
         } catch (e) {
-          process.stdout.write('Message error: ' + e.stack + '\n');
+          process.stdout.write('Message handler error: ' + e.stack + '\n');
         }
       }
     });
@@ -694,14 +839,21 @@ const startBot = async () => {
   } catch (e) {
     isReconnecting = false;
     process.stdout.write('startBot error: ' + e.stack + '\n');
+    process.stdout.write('Restarting in 10 seconds...\n');
     setTimeout(startBot, 10000);
   }
 };
 
-process.on('uncaughtException', err => process.stdout.write('UNCAUGHT: ' + err.stack + '\n'));
-process.on('unhandledRejection', err => process.stdout.write('REJECTION: ' + (err?.stack || err) + '\n'));
+// ── CRASH RECOVERY ───────────────────────────────────────────
+process.on('uncaughtException', err => {
+  process.stdout.write('UNCAUGHT EXCEPTION: ' + err.stack + '\n');
+});
 
-// ── HTTP KEEPALIVE ────────────────────────────────────────────
+process.on('unhandledRejection', err => {
+  process.stdout.write('UNHANDLED REJECTION: ' + (err?.stack || err) + '\n');
+});
+
+// ── HTTP KEEPALIVE (prevents Railway SIGTERM) ────────────────
 const http = require('http');
 http.createServer((req, res) => {
   res.writeHead(200);
@@ -710,8 +862,5 @@ http.createServer((req, res) => {
   process.stdout.write('HTTP server listening on port ' + (process.env.PORT || 3000) + '\n');
 });
 
-// ── START ─────────────────────────────────────────────────────
-(async () => {
-  redisClient = await initRedis();
-  startBot();
-})();
+// ── START ────────────────────────────────────────────────────
+startBot();
