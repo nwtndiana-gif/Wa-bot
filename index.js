@@ -693,6 +693,11 @@ const startBot = async () => {
           process.stdout.write('Session invalid. Clearing and restarting...\n');
           clearSession();
           setTimeout(startBot, 5000);
+        } else if (statusCode === 440) {
+          // Connection replaced — another instance is running.
+          // Wait longer to let the other instance disconnect first.
+          process.stdout.write('Connection replaced (440). Waiting 15s before reconnecting...\n');
+          setTimeout(startBot, 15000);
         } else {
           process.stdout.write('Reconnecting in 5 seconds...\n');
           setTimeout(startBot, 5000);
@@ -866,4 +871,7 @@ http.createServer((req, res) => {
 });
 
 // ── START ────────────────────────────────────────────────────
-startBot();
+// Wait 8 seconds on first start — gives any previous Railway container
+// time to fully disconnect from WhatsApp before this one connects.
+// This prevents the 440 "Connection Replaced" loop.
+setTimeout(startBot, 8000);
