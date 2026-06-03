@@ -642,8 +642,11 @@ const startBot = async () => {
       printQRInTerminal: false,
       logger:            pino({ level: 'warn' }),   // was 'silent' — warn is better for real errors
       browser:           ['Ubuntu', 'Chrome', '20.0.04'],
-      syncFullHistory:   false,
-      markOnlineOnConnect: false
+      syncFullHistory:      false,
+      markOnlineOnConnect:  false,
+      fireInitQueries:      false,
+      // Prevents 'unexpected error in init queries' crash on connect
+      getMessage: async () => { return { conversation: '' }; }
     });
 
     sock.ev.on('creds.update', async () => {
